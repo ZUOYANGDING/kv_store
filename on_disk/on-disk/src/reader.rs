@@ -3,8 +3,8 @@ use std::io::{BufReader, Read, Seek};
 
 // struct to hold current reader and its postion
 pub struct BufferReaderWithPosition<R: Read + Seek> {
-    pub reader: BufReader<R>,
-    pub position: u64,
+    reader: BufReader<R>,
+    position: u64,
 }
 
 /// read the `buf` into buffer, updated cursor position and return offset
@@ -31,5 +31,9 @@ impl<R: Read + Seek> BufferReaderWithPosition<R> {
             reader: BufReader::new(inner),
             position,
         })
+    }
+
+    pub fn position(&self) -> u64 {
+        self.position
     }
 }

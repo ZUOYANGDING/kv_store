@@ -2,11 +2,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::Seek,
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
-use crate::{command::Command, error::Result, reader};
+use crate::{
+    command::Command,
+    error::{KVStoreError, Result},
+    reader,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
@@ -14,6 +18,8 @@ use serde_json::Deserializer;
 use crate::{
     command::CommandMetaData, reader::BufferReaderWithPosition, writer::BufferWriterWithPosition,
 };
+
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 pub struct KVStore {
     // abs path to log files
@@ -31,6 +37,10 @@ pub struct KVStore {
 }
 
 impl KVStore {
+    /// open the existing db files.
+    /// load exsiting readers
+    /// load most recent writer
+    /// load most recent command into index_map and uncompacted data in bytes
     pub fn open(path: impl Into<PathBuf>) -> Result<KVStore> {
         // create dir for files
         let path = path.into();
@@ -62,6 +72,148 @@ impl KVStore {
             index_map,
             uncompacted,
         })
+    }
+
+    /// set <key, value>
+    /// if key already exists, value will be overwritten by the input one
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        // create set command
+        let command = Command::Set(key, value);
+        // get writer's position before write, which will be the offset(start point) of the current command
+        let prev_pos = self.writer.position();
+        // serialize the command and write it into current writer's buffer
+        serde_json::to_writer(&mut self.writer, &command)?;
+        // get length of input data in data file
+        let data_length = self.writer.position() - prev_pos;
+        // update index_map and uncompacted data
+        if let Command::Set(key, _) = command {
+            self.uncompacted += self
+                .index_map
+                .insert(
+                    key,
+                    CommandMetaData {
+                        file_number: self.current_file_num,
+                        offset: prev_pos,
+                        length: data_length,
+                    },
+                )
+                .map(|md| md.length)
+                .unwrap_or(0_u64);
+        }
+        // flush the current writer's buffer
+        self.writer.flush()?;
+        // check if need compact
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// get value by input key
+    /// None if the key does not exist
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        // get command meta data
+        if let Some(command_meta_data) = self.index_map.get(&key) {
+            // reader in target file
+            let source_reader = self
+                .readers
+                .get_mut(&command_meta_data.file_number)
+                .expect("cannot get reader");
+            // seek to the start postion of the command
+            source_reader.seek(std::io::SeekFrom::Start(command_meta_data.offset))?;
+            let data_reader = source_reader.take(command_meta_data.length);
+            if let Command::Set(_, value) = serde_json::from_reader(data_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KVStoreError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// remove the key if exist
+    /// write the remove command into log file
+    /// update uncompacted data (include the old `set` and this `remove`)
+    pub fn remove(&mut self, key: String) -> Result<()> {
+        // check if key exists
+        if self.index_map.contains_key(&key) {
+            // remove command and data from index_map, and update uncompacted data
+            self.uncompacted += self
+                .index_map
+                .remove(&key)
+                .map(|md| md.length)
+                .unwrap_or(0_u64);
+            // create a remove command
+            let command = Command::Remove(key);
+            // get the current writer's postion as offset(start point)
+            let prev_pos = self.writer.position();
+            // write the remove command
+            serde_json::to_writer(&mut self.writer, &command)?;
+            // get remove command length
+            let data_length = self.writer.position() - prev_pos;
+            // update uncompated data
+            self.uncompacted += data_length;
+            self.writer.flush()?;
+            // check if need compact
+            if self.uncompacted > COMPACTION_THRESHOLD {
+                self.compact()?;
+            }
+            Ok(())
+        } else {
+            Err(KVStoreError::KeyNotFound)
+        }
+    }
+
+    /// compact uncompact data to a compact file
+    pub fn compact(&mut self) -> Result<()> {
+        // increase the current file number by 1 to create a compact file
+        let compact_file_num = self.current_file_num + 1;
+        let mut compact_writer =
+            self::new_file(&self.db_path, compact_file_num, &mut self.readers)?;
+        // offset before write in compact file
+        let mut prev_offset = 0_u64;
+        // start to write compact file
+        for command_meta_data in self.index_map.values_mut() {
+            // get the reader
+            let reader = self
+                .readers
+                .get_mut(&command_meta_data.file_number)
+                .expect("cannot get reader");
+            // seek to command position
+            reader.seek(std::io::SeekFrom::Start(command_meta_data.offset))?;
+            // read the command and data into writer
+            let mut command_entry = reader.take(command_meta_data.length);
+            io::copy(&mut command_entry, &mut compact_writer)?;
+            // replace the current command meta data by the new meta data in compact file
+            *command_meta_data = CommandMetaData {
+                offset: prev_offset,
+                length: compact_writer.position() - prev_offset,
+                file_number: compact_file_num,
+            };
+            // update offset position
+            prev_offset = compact_writer.position();
+        }
+        // flush the compact writer
+        compact_writer.flush()?;
+        // collect file number that has been
+        let file_num_vec: Vec<u64> = self
+            .readers
+            .keys()
+            .filter(|&&file_number| file_number < compact_file_num)
+            .cloned()
+            .collect();
+        // delete collected files
+        for file_num in file_num_vec {
+            self.readers.remove(&file_num);
+            fs::remove_file(build_file_path_by_number(&self.db_path, file_num))?;
+        }
+        // update current file number and current writer
+        self.current_file_num += 2;
+        self.writer = new_file(&self.db_path, self.current_file_num, &mut self.readers)?;
+        // reset the uncompated data size
+        self.uncompacted = 0_u64;
+        Ok(())
     }
 }
 
@@ -114,6 +266,9 @@ fn load_uncompacted_data(
     Ok(uncompatced)
 }
 
+/// open/create a new file
+///
+/// create a BufferReaderWithPosition for this file and put it into the reader cache
 fn new_file(
     path: &Path,
     file_num: u64,
@@ -134,10 +289,12 @@ fn new_file(
     Ok(writer)
 }
 
+/// create file path
 fn build_file_path_by_number(path: &Path, file_num: u64) -> PathBuf {
     path.join(format!("{}.log", file_num))
 }
 
+/// sort the file by its number
 fn sort_file_by_number(path: &Path) -> Result<Vec<u64>> {
     let mut file_num_list: Vec<u64> = fs::read_dir(path)?
         .flat_map(|res| -> Result<_> { Ok(res?.path()) })

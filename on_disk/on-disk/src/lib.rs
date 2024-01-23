@@ -1,5 +1,10 @@
 mod command;
+pub use command::*;
 mod error;
+pub use error::*;
 mod kv;
+pub use kv::*;
 mod reader;
+pub use reader::*;
 mod writer;
+pub use writer::*;

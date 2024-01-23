@@ -2,8 +2,8 @@ use crate::error::Result;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 /// struct to hold current buffer writer and its position
 pub struct BufferWriterWithPosition<W: Write + Seek> {
-    pub position: u64,
-    pub writer: BufWriter<W>,
+    position: u64,
+    writer: BufWriter<W>,
 }
 
 impl<W: Write + Seek> BufferWriterWithPosition<W> {
@@ -13,6 +13,10 @@ impl<W: Write + Seek> BufferWriterWithPosition<W> {
             position,
             writer: BufWriter::new(inner),
         })
+    }
+
+    pub fn position(&self) -> u64 {
+        self.position
     }
 }
 
