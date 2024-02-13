@@ -8,7 +8,7 @@ use sled::{Db, Tree};
 pub struct SledKVStore(Db);
 
 impl SledKVStore {
-    pub fn new(db: Db) -> Self {
+    pub fn open(db: Db) -> Self {
         SledKVStore(db)
     }
 }
