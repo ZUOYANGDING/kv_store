@@ -3,14 +3,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
-use crate::Result;
+use crate::{KVStoreEngine, Result};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
-    fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
 };
+
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 pub struct KVStore {
     // path to database
@@ -35,20 +37,134 @@ impl KVStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<KVStore> {
         // open existing db by input path
         let path = path.into();
-        fs::create_dir_all(&path.into())?;
-        let readers: HashMap<u64, BufferReaderWithPosition<File>> = HashMap::new();
-        let index_map: BTreeMap<String, CommandMedaData> = BTreeMap::new();
+        fs::create_dir_all(&path)?;
+        let mut readers: HashMap<u64, BufferReaderWithPosition<File>> = HashMap::new();
+        let mut index_map: BTreeMap<String, CommandMedaData> = BTreeMap::new();
 
         let file_num_list = sort_file_by_number(&path)?;
-        let uncompact = 0_u64;
-        // load uncompacted data
-        for file_num in file_num_list {
-            let file_path: PathBuf = build_file_path_by_number(&path, file_num);
+        let mut uncompact = 0_u64;
+        // load uncompacted data, and update readers' map
+        for file_num in &file_num_list {
+            let file_path: PathBuf = build_file_path_by_number(&path, file_num.to_owned());
             let mut file = BufferReaderWithPosition::new(File::open(file_path)?)?;
-            uncompact += load_uncompacted_data(file_num, &mut file, &mut index_map)?;
+            uncompact += load_uncompacted_data(file_num.to_owned(), &mut file, &mut index_map)?;
+            // insert file into readers's map
+            readers.insert(file_num.to_owned(), file);
         }
-        Ok()
+        let current_file_number = file_num_list.last().unwrap_or(&0) + 1;
+        let current_writer = new_file(&path, current_file_number, &mut readers)?;
+        Ok(KVStore {
+            db_path: path,
+            current_file_number,
+            readers,
+            current_writer,
+            index_map,
+            uncompact,
+        })
     }
+
+    /// compact uncompacted data
+    pub fn compact(&mut self) -> Result<()> {
+        // create a new file to store data after compacted
+        let compact_file_number = self.current_file_number + 1;
+        let mut compact_writer =
+            self::new_file(&self.db_path, compact_file_number, &mut self.readers)?;
+        let mut offset = 0_u64;
+        for command_meta_data in self.index_map.values_mut() {
+            // get the reader file by file number
+            let reader = self
+                .readers
+                .get_mut(&command_meta_data.file_number)
+                .expect("cannot find matched reader");
+            // seek to the command
+            reader.seek(std::io::SeekFrom::Start(command_meta_data.offset))?;
+            // get command
+            let mut command = reader.take(command_meta_data.length);
+            // write into writer
+            io::copy(&mut command, &mut compact_writer)?;
+            // updated the CommandMetaData in index_map by the CommandMetaData in compact file
+            *command_meta_data = CommandMedaData {
+                file_number: compact_file_number,
+                length: compact_writer.position - offset,
+                offset,
+            };
+            // update offset
+            offset = compact_writer.position;
+        }
+        compact_writer.flush()?;
+        // delete the compacted files
+        let compacted_file_number_list: Vec<u64> = self
+            .readers
+            .keys()
+            .filter(|&&file_num| file_num < compact_file_number)
+            .cloned()
+            .collect();
+        for file_num in compacted_file_number_list {
+            self.readers.remove(&file_num);
+            fs::remove_file(build_file_path_by_number(&self.db_path, file_num))?;
+        }
+        self.current_file_number = compact_file_number + 1;
+        self.current_writer =
+            self::new_file(&self.db_path, self.current_file_number, &mut self.readers)?;
+        self.uncompact = 0_u64;
+        Ok(())
+    }
+}
+
+impl KVStoreEngine for KVStore {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let command = Command::set(key.to_owned(), value);
+        let offset = self.current_writer.position;
+        serde_json::to_writer(&mut self.current_writer, &command)?;
+        let command_length = self.current_writer.position - offset;
+        let old_data = self.index_map.insert(
+            key.to_owned(),
+            CommandMedaData {
+                file_number: self.current_file_number,
+                offset,
+                length: command_length,
+            },
+        );
+        self.uncompact += old_data.map(|cmd| cmd.length).unwrap_or(0_u64);
+        self.current_writer.flush()?;
+        if self.uncompact > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        todo!()
+    }
+
+    fn remove(&mut self, key: String) -> Result<()> {
+        todo!()
+    }
+}
+
+/// open/create a new file
+///
+/// create a BufferReaderWithPosition for this file and put it into the reader cache
+///
+/// return a BufferWriterWithPosition with the created/open file
+fn new_file(
+    dir_path: &Path,
+    file_num: u64,
+    readers: &mut HashMap<u64, BufferReaderWithPosition<File>>,
+) -> Result<BuffferWriterWithPosition<File>> {
+    let file_path = build_file_path_by_number(dir_path, file_num);
+    let writer = BuffferWriterWithPosition::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .write(true)
+            .open(&file_path)?,
+    )?;
+    readers.insert(
+        file_num,
+        BufferReaderWithPosition::new(File::open(&file_path)?)?,
+    );
+    Ok(writer)
 }
 
 /// Go through the log file
@@ -73,7 +189,7 @@ fn load_uncompacted_data(
         let new_offset = commands.byte_offset() as u64;
         match command? {
             Command::Set(key, _) => {
-                let data = index_map.insert(
+                let old_data = index_map.insert(
                     key,
                     CommandMedaData {
                         file_number,
@@ -82,12 +198,12 @@ fn load_uncompacted_data(
                     },
                 );
                 // add the length of prev `set` with the same input key command as uncompacted data
-                data_in_bytes += data.map(|cmd| cmd.length).unwrap_or(0);
+                data_in_bytes += old_data.map(|cmd| cmd.length).unwrap_or(0);
             }
             Command::Remove(key) => {
-                let data = index_map.remove(&key);
+                let old_data = index_map.remove(&key);
                 // add the removed `set` with input key command as uncompacted data
-                data_in_bytes += data.map(|cmd| cmd.length).unwrap_or(0);
+                data_in_bytes += old_data.map(|cmd| cmd.length).unwrap_or(0);
                 // add the `remove` command itself as uncompacted data
                 data_in_bytes += new_offset - old_offset;
             }
