@@ -1,13 +1,13 @@
 //! This is implementation of KVStoreEngine by KVStore DB
 
-use serde::{Deserialize, Serialize};
+use serde::{de::value, Deserialize, Serialize};
 use serde_json::Deserializer;
 
 use crate::{KVStoreEngine, Result};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, read, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
 };
@@ -23,7 +23,7 @@ pub struct KVStore {
     pub readers: HashMap<u64, BufferReaderWithPosition<File>>,
     // current file writer
     pub current_writer: BuffferWriterWithPosition<File>,
-    // newest command cache
+    // newest command cache (only cache `SET` command)
     pub index_map: BTreeMap<String, CommandMedaData>,
     // size of uncompacted data in bytes
     pub uncompact: u64,
@@ -134,11 +134,45 @@ impl KVStoreEngine for KVStore {
     }
 
     fn get(&mut self, key: String) -> Result<Option<String>> {
-        todo!()
+        if let Some(command_meta_data) = self.index_map.get(&key) {
+            // get reader by CommandMetaData
+            let reader = self
+                .readers
+                .get_mut(&command_meta_data.file_number)
+                .expect("cannot find matched reader");
+            // seek to command position
+            reader.seek(io::SeekFrom::Start(command_meta_data.offset))?;
+            // get the data
+            let data = reader.take(command_meta_data.length);
+            if let Command::Set(_, value) = serde_json::from_reader(data)? {
+                Ok(Some(value))
+            } else {
+                Err(crate::KVStoreError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     fn remove(&mut self, key: String) -> Result<()> {
-        todo!()
+        if self.index_map.contains_key(&key) {
+            let command_meta_data = self.index_map.remove(&key);
+            self.uncompact += command_meta_data.map(|cmd| cmd.length).unwrap_or(0);
+            // create and write the Remove command into current writer file
+            let command = Command::rm(key);
+            let offset = self.current_writer.position;
+            serde_json::to_writer(&mut self.current_writer, &command)?;
+            let data_length = self.current_writer.position - offset;
+            // add the remove command into uncompact data
+            self.uncompact += data_length;
+            self.current_writer.flush()?;
+            if self.uncompact > COMPACTION_THRESHOLD {
+                self.compact()?;
+            }
+            Ok(())
+        } else {
+            Err(crate::KVStoreError::KeyNotFound)
+        }
     }
 }
 
